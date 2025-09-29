@@ -19,14 +19,14 @@ Coze Studio 遵循微服务架构，前后端组件之间有明确的分离。�
 
 ```mermaid
 graph TB
-    A[前端 (React)] --> B(API 网关 - Nginx)
-    B --> C[后端 (Go/Hertz)]
+    A[前端React] --> B[API 网关 - Nginx]
+    B --> C[后端 Go/Hertz]
     C --> D[应用服务]
     C --> E[领域服务]
     C --> F[基础设施层]
-    F --> G[数据库 (MySQL)]
-    F --> H[消息队列 (NSQ)]
-    F --> I[存储 (MinIO)]
+    F --> G[数据库 MySQL]
+    F --> H[消息队列 NSQ]
+    F --> I[存储 MinIO]
 ```
 
 ### 2.2 组件架构
@@ -60,19 +60,19 @@ graph TD
     A[API 层 - HTTP] --> B[应用层]
     B --> C[领域层]
     C --> D[基础设施层]
-    
+
     subgraph API层
         A
     end
-    
+
     subgraph 应用层
         B
     end
-    
+
     subgraph 领域层
         C
     end
-    
+
     subgraph 基础设施层
         D
     end
@@ -168,21 +168,21 @@ graph TB
     A --> C[coze-server 1]
     A --> D[coze-server 2]
     A --> E[coze-server 3]
-    
+
     C --> F[MySQL]
     C --> G[Redis]
     C --> H[Elasticsearch]
     C --> I[MinIO]
     C --> J[Etcd]
     C --> K[Milvus]
-    
+
     D --> F
     D --> G
     D --> H
     D --> I
     D --> J
     D --> K
-    
+
     E --> F
     E --> G
     E --> H
