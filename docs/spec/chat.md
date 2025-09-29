@@ -311,6 +311,350 @@ func (art *AgentRuntime) Run(ctx context.Context) (err error) {
 }
 ```
 
+### ChatflowRun 实现
+
+当 Agent 处于工作流模式（[BotMode_WorkflowMode](../../frontend/packages/arch/idl/src/auto-generated/flow_bot_operation/namespaces/benefit_common.ts#L217-L217)）时，会调用 [ChatflowRun](../../backend/domain/conversation/agentrun/internal/chatflow_run.go#L32-L92) 方法执行工作流逻辑：
+
+```go
+func (art *AgentRuntime) ChatflowRun(ctx context.Context, imagex imagex.ImageX) (err error) {
+
+	mh := &MessageEventHandler{
+		sw:           art.SW,
+		messageEvent: art.MessageEvent,
+	}
+	resumeInfo := parseResumeInfo(ctx, art.GetHistory())
+	wfID, _ := strconv.ParseInt(art.GetAgentInfo().LayoutInfo.WorkflowId, 10, 64)
+
+	if wfID == 0 {
+		mh.handlerErr(ctx, errorx.New(errno.ErrAgentRunWorkflowNotFound))
+		return
+	}
+	var wfStreamer *schema.StreamReader[*crossworkflow.WorkflowMessage]
+
+	executeConfig := crossworkflow.ExecuteConfig{
+		ID:           wfID,
+		ConnectorID:  art.GetRunMeta().ConnectorID,
+		ConnectorUID: art.GetRunMeta().UserID,
+		AgentID:      ptr.Of(art.GetRunMeta().AgentID),
+		Mode:         crossworkflow.ExecuteModeRelease,
+		BizType:      crossworkflow.BizTypeAgent,
+		SyncPattern:  crossworkflow.SyncPatternStream,
+		From:         crossworkflow.FromLatestVersion,
+	}
+
+	if resumeInfo != nil {
+		wfStreamer, err = crossworkflow.DefaultSVC().StreamResume(ctx, &crossworkflow.ResumeRequest{
+			ResumeData: concatWfInput(art),
+			EventID:    resumeInfo.ChatflowInterrupt.InterruptEvent.ID,
+			ExecuteID:  resumeInfo.ChatflowInterrupt.ExecuteID,
+		}, executeConfig)
+	} else {
+		executeConfig.ConversationID = &art.GetRunMeta().ConversationID
+		executeConfig.SectionID = &art.GetRunMeta().SectionID
+		executeConfig.InitRoundID = &art.RunRecord.ID
+		executeConfig.RoundID = &art.RunRecord.ID
+		executeConfig.UserMessage = transMessageToSchemaMessage(ctx, []*msgEntity.Message{art.GetInput()}, imagex)[0]
+		executeConfig.MaxHistoryRounds = ptr.Of(getAgentHistoryRounds(art.GetAgentInfo()))
+		chatInput := map[string]any{
+			"USER_INPUT": concatWfInput(art),
+		}
+		if art.GetRunMeta().ChatflowParameters != nil {
+			for k, v := range art.GetRunMeta().ChatflowParameters {
+				chatInput[k] = v
+			}
+		}
+		wfStreamer, err = crossworkflow.DefaultSVC().StreamExecute(ctx, executeConfig, chatInput)
+	}
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	safego.Go(ctx, func() {
+		defer wg.Done()
+		art.pullWfStream(ctx, wfStreamer, mh)
+	})
+	wg.Wait()
+	return err
+}
+```
+
+工作流执行过程中，通过 [pullWfStream](../../backend/domain/conversation/agentrun/internal/chatflow_run.go#L122-L220) 方法处理工作流返回的流式消息：
+
+```go
+func (art *AgentRuntime) pullWfStream(ctx context.Context, events *schema.StreamReader[*crossworkflow.WorkflowMessage], mh *MessageEventHandler) {
+
+	fullAnswerContent := bytes.NewBuffer([]byte{})
+	var usage *msgEntity.UsageExt
+
+	preAnswerMsg, cErr := preCreateAnswer(ctx, art)
+
+	if cErr != nil {
+		return
+	}
+
+	var preMsgIsFinish = false
+	var lastAnswerMsg *entity.ChunkMessageItem
+
+	for {
+		st, re := events.Recv()
+		if re != nil {
+			if errors.Is(re, io.EOF) {
+
+				if lastAnswerMsg != nil && usage != nil {
+					art.SetUsage(&agentrun.Usage{
+						LlmPromptTokens:     usage.InputTokens,
+						LlmCompletionTokens: usage.OutputTokens,
+						LlmTotalTokens:      usage.TotalCount,
+					})
+					_ = mh.handlerWfUsage(ctx, lastAnswerMsg, usage)
+				}
+
+				finishErr := mh.handlerFinalAnswerFinish(ctx, art)
+				if finishErr != nil {
+					logs.CtxErrorf(ctx, "handlerFinalAnswerFinish error: %v", finishErr)
+					return
+				}
+				return
+			}
+			logs.CtxErrorf(ctx, "pullWfStream Recv error: %v", re)
+			mh.handlerErr(ctx, re)
+			return
+		}
+		if st == nil {
+			continue
+		}
+		if st.StateMessage != nil {
+			if st.StateMessage.Status == crossworkflow.WorkflowFailed {
+				mh.handlerErr(ctx, st.StateMessage.LastError)
+				continue
+			}
+			if st.StateMessage.Usage != nil {
+				usage = &msgEntity.UsageExt{
+					InputTokens:  st.StateMessage.Usage.InputTokens,
+					OutputTokens: st.StateMessage.Usage.OutputTokens,
+					TotalCount:   st.StateMessage.Usage.InputTokens + st.StateMessage.Usage.OutputTokens,
+				}
+			}
+
+			if st.StateMessage.InterruptEvent != nil { // interrupt
+				mh.handlerWfInterruptMsg(ctx, st.StateMessage, art)
+				continue
+			}
+
+		}
+
+		if st.DataMessage == nil {
+			continue
+		}
+
+		switch st.DataMessage.Type {
+		case crossworkflow.Answer:
+
+			// input node & question node skip
+			if st.DataMessage != nil && (st.DataMessage.NodeType == crossworkflow.NodeTypeInputReceiver || st.DataMessage.NodeType == crossworkflow.NodeTypeQuestion) {
+				break
+			}
+
+			if preMsgIsFinish {
+				preAnswerMsg, cErr = preCreateAnswer(ctx, art)
+				if cErr != nil {
+					return
+				}
+				preMsgIsFinish = false
+			}
+			if st.DataMessage.Content != "" {
+				fullAnswerContent.WriteString(st.DataMessage.Content)
+			}
+
+			sendAnswerMsg := buildSendMsg(ctx, preAnswerMsg, false, art)
+			sendAnswerMsg.Content = st.DataMessage.Content
+
+			mh.messageEvent.SendMsgEvent(entity.RunEventMessageDelta, sendAnswerMsg, mh.sw)
+
+			if st.DataMessage.Last {
+				preMsgIsFinish = true
+				sendAnswerMsg := buildSendMsg(ctx, preAnswerMsg, false, art)
+				sendAnswerMsg.Content = fullAnswerContent.String()
+				fullAnswerContent.Reset()
+				hfErr := mh.handlerAnswer(ctx, sendAnswerMsg, usage, art, preAnswerMsg)
+				if hfErr != nil {
+					return
+				}
+				lastAnswerMsg = sendAnswerMsg
+			}
+		}
+	}
+}
+```
+
+### AgentStreamExecute 实现
+
+当 Agent 处于单智能体模式时，会调用 [AgentStreamExecute](../../backend/domain/conversation/agentrun/internal/singleagent_run.go#L31-L78) 方法执行智能体逻辑：
+
+```go
+func (art *AgentRuntime) AgentStreamExecute(ctx context.Context, imagex imagex.ImageX) (err error) {
+	mainChan := make(chan *entity.AgentRespEvent, 100)
+
+	ar := &crossagent.AgentRuntime{
+		AgentVersion:     art.GetRunMeta().Version,
+		SpaceID:          art.GetRunMeta().SpaceID,
+		AgentID:          art.GetRunMeta().AgentID,
+		IsDraft:          art.GetRunMeta().IsDraft,
+		UserID:           art.GetRunMeta().UserID,
+		ConversationId:   art.GetRunMeta().ConversationID,
+		ConnectorID:      art.GetRunMeta().ConnectorID,
+		PreRetrieveTools: art.GetRunMeta().PreRetrieveTools,
+		CustomVariables:  art.GetRunMeta().CustomVariables,
+		Input:            transMessageToSchemaMessage(ctx, []*msgEntity.Message{art.GetInput()}, imagex)[0],
+		HistoryMsg:       transMessageToSchemaMessage(ctx, historyPairs(art.GetHistory()), imagex),
+		ResumeInfo:       parseResumeInfo(ctx, art.GetHistory()),
+	}
+
+	streamer, err := crossagent.DefaultSVC().StreamExecute(ctx, ar)
+	if err != nil {
+		return errors.New(errorx.ErrorWithoutStack(err))
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	safego.Go(ctx, func() {
+		defer wg.Done()
+		art.pull(ctx, mainChan, streamer)
+	})
+
+	safego.Go(ctx, func() {
+		defer wg.Done()
+		art.push(ctx, mainChan)
+	})
+
+	wg.Wait()
+
+	return err
+}
+```
+
+[AgentStreamExecute](../../backend/domain/conversation/agentrun/internal/singleagent_run.go#L31-L78) 采用生产者-消费者模式处理智能体返回的流式消息。[pull](../../backend/domain/conversation/agentrun/internal/singleagent_run.go#L329-L375) 方法作为生产者，从智能体获取流式响应并放入通道中；[push](../../backend/domain/conversation/agentrun/internal/singleagent_run.go#L82-L327) 方法作为消费者，从通道中读取消息并进行处理。
+
+```go
+func (art *AgentRuntime) pull(_ context.Context, mainChan chan *entity.AgentRespEvent, events *schema.StreamReader[*crossagent.AgentEvent]) {
+	defer func() {
+		close(mainChan)
+	}()
+
+	for {
+		rm, re := events.Recv()
+		if re != nil {
+			errChunk := &entity.AgentRespEvent{
+				Err: re,
+			}
+			mainChan <- errChunk
+			return
+		}
+
+		eventType, tErr := transformEventMap(rm.EventType)
+
+		if tErr != nil {
+			errChunk := &entity.AgentRespEvent{
+				Err: tErr,
+			}
+			mainChan <- errChunk
+			return
+		}
+
+		respChunk := &entity.AgentRespEvent{
+			EventType:    eventType,
+			ModelAnswer:  rm.ChatModelAnswer,
+			ToolsMessage: rm.ToolsMessage,
+			FuncCall:     rm.FuncCall,
+			Knowledge:    rm.Knowledge,
+			Suggest:      rm.Suggest,
+			Interrupt:    rm.Interrupt,
+
+			ToolMidAnswer: rm.ToolMidAnswer,
+			ToolAsAnswer:  rm.ToolAsChatModelAnswer,
+		}
+
+		mainChan <- respChunk
+	}
+}
+```
+
+[push](../../backend/domain/conversation/agentrun/internal/singleagent_run.go#L82-L327) 方法处理各种类型的事件消息，包括模型回答、工具调用、知识库检索结果等：
+
+```go
+func (art *AgentRuntime) push(ctx context.Context, mainChan chan *entity.AgentRespEvent) {
+
+	mh := &MessageEventHandler{
+		sw:           art.SW,
+		messageEvent: art.MessageEvent,
+	}
+
+	var err error
+	defer func() {
+		if err != nil {
+			logs.CtxErrorf(ctx, "run.push error: %v", err)
+			mh.handlerErr(ctx, err)
+		}
+	}()
+
+	reasoningContent := bytes.NewBuffer([]byte{})
+
+	var firstAnswerMsg *msgEntity.Message
+	var reasoningMsg *msgEntity.Message
+	isSendFinishAnswer := false
+	var preToolResponseMsg *msgEntity.Message
+	toolResponseMsgContent := bytes.NewBuffer([]byte{})
+	for {
+		chunk, ok := <-mainChan
+		if !ok || chunk == nil {
+			return
+		}
+
+		if chunk.Err != nil {
+			if errors.Is(chunk.Err, io.EOF) {
+				if !isSendFinishAnswer {
+					isSendFinishAnswer = true
+					if firstAnswerMsg != nil && len(reasoningContent.String()) > 0 {
+						art.saveReasoningContent(ctx, firstAnswerMsg, reasoningContent.String())
+						reasoningContent.Reset()
+					}
+
+					finishErr := mh.handlerFinalAnswerFinish(ctx, art)
+					if finishErr != nil {
+						err = finishErr
+						return
+					}
+				}
+				return
+			}
+			mh.handlerErr(ctx, chunk.Err)
+			return
+		}
+
+		switch chunk.EventType {
+		case message.MessageTypeFunctionCall:
+			// 处理函数调用
+		case message.MessageTypeToolResponse:
+			// 处理工具响应
+		case message.MessageTypeKnowledge:
+			// 处理知识库消息
+		case message.MessageTypeToolMidAnswer:
+			// 处理工具中间答案
+		case message.MessageTypeToolAsAnswer:
+			// 处理工具作为答案
+		case message.MessageTypeAnswer:
+			// 处理模型回答
+		case message.MessageTypeFlowUp:
+			// 处理流程结束和建议
+		case message.MessageTypeInterrupt:
+			// 处理中断
+		}
+	}
+}
+```
+
 ### 流式响应处理
 
 应用层通过 [pullStream](../../backend/application/conversation/agent_run.go#L109-L142) 方法处理来自领域层的流式响应：
@@ -417,3 +761,9 @@ func (c *ConversationApplicationService) pullStream(ctx context.Context, sseSend
 ## 总结
 
 Coze Studio 的聊天 API 实现了一个完整的智能体对话系统，从前端用户交互到后端复杂的消息处理和 Agent 执行。系统采用流式响应机制，能够实时返回 Agent 的生成结果，提供良好的用户体验。通过模块化设计，系统具有良好的可扩展性和维护性。
+
+根据 Agent 的不同模式（单智能体模式或工作流模式），系统采用不同的执行路径：
+1. 工作流模式：通过 [ChatflowRun](../../backend/domain/conversation/agentrun/internal/chatflow_run.go#L32-L92) 执行工作流逻辑
+2. 单智能体模式：通过 [AgentStreamExecute](../../backend/domain/conversation/agentrun/internal/singleagent_run.go#L31-L78) 执行智能体逻辑
+
+两种模式都支持流式响应处理，能够实时返回中间结果和最终答案。
