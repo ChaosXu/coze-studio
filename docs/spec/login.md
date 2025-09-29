@@ -91,6 +91,153 @@ useEffect(() => {
 }, [loginStatus]);
 ```
 
+## 路由重定向流程
+
+### 从根路径 `/` 到工作空间路径
+
+当用户登录成功后，会被重定向到根路径 `/`。根据路由配置，系统会进一步重定向到 `/space`：
+
+```typescript
+// frontend/apps/coze-studio/src/routes/index.tsx
+{
+  path: '/',
+  Component: Layout,
+  errorElement: <GlobalError />,
+  children: [
+    {
+      index: true,
+      element: <Navigate to="/space" replace />,
+    },
+    // ...
+  ]
+}
+```
+
+接着，系统会根据 `/space` 路径的配置继续重定向：
+
+```typescript
+// frontend/apps/coze-studio/src/routes/index.tsx
+{
+  path: 'space',
+  Component: SpaceLayout,
+  loader: () => ({
+    hasSider: true,
+    requireAuth: true,
+    subMenu: spaceSubMenu,
+    menuKey: BaseEnum.Space,
+  }),
+  children: [
+    {
+      path: ':space_id',
+      Component: SpaceIdLayout,
+      children: [
+        {
+          index: true,
+          element: <Navigate to="develop" replace />,
+        },
+        // ...
+      ]
+    }
+  ]
+}
+```
+
+### 工作空间初始化和默认重定向
+
+在 `SpaceLayout` 组件中，系统会使用 `useInitSpace` hook 来初始化工作空间：
+
+```typescript
+// frontend/packages/foundation/space-ui-base/src/hooks/use-init-space.ts
+const getFallbackWorkspaceURL = async (
+  fallbackSpaceID: string,
+  fallbackSpaceMenu: string,
+  checkSpaceID: (id: string) => boolean,
+) => {
+  const targetSpaceId =
+    (await localStorageService.getValueSync('workspace-spaceId')) ??
+    fallbackSpaceID;
+  const targetSpaceSubMenu =
+    (await localStorageService.getValueSync('workspace-subMenu')) ??
+    fallbackSpaceMenu;
+
+  if (targetSpaceId && checkSpaceID(targetSpaceId)) {
+    return `/space/${targetSpaceId}/${targetSpaceSubMenu}`;
+  }
+
+  return `/space/${fallbackSpaceID}/${targetSpaceSubMenu}`;
+};
+
+// 如果没有指定 spaceId，则跳转到个人空间的开发子路由
+if (!spaceId) {
+  // 拉取空间列表
+  await useSpaceStore.getState().fetchSpaces(true);
+  // 获取个人空间 ID
+  const personalSpaceID = useSpaceStore.getState().getPersonalSpaceID();
+  // 空间列表中的第一个空间
+  const firstSpaceID = useSpaceStore.getState().spaceList[0]?.id;
+  // 未指定 SpaceId 时的备选空间 ID
+  const fallbackSpaceID = personalSpaceID ?? firstSpaceID ?? '';
+  // 检查指定的 spaceId 是否可访问
+  const { checkSpaceID } = useSpaceStore.getState();
+
+  // 没有工作空间，提示创建
+  if (!fallbackSpaceID) {
+    Toast.warning(I18n.t('enterprise_workspace_default_tips2_toast'));
+  } else {
+    // 获取跳转 URL
+    const targetURL = await getFallbackWorkspaceURL(
+      fallbackSpaceID,
+      'develop',
+      checkSpaceID,
+    );
+    // 跳转
+    navigate(targetURL);
+  }
+}
+```
+
+这个流程会最终将用户重定向到类似 `/space/7555358433977827328/develop` 的路径。
+
+## Space ID 的生成
+
+在用户注册时，系统会为每个用户创建一个个人空间（Personal Space），这个空间的 ID 是通过 ID 生成器生成的全局唯一 ID。
+
+```go
+// backend/domain/user/service/user_impl.go
+func (u *userImpl) Create(ctx context.Context, req *CreateUserRequest) (user *userEntity.User, err error) {
+    // ... 用户创建逻辑
+
+    spaceID := req.SpaceID
+    if spaceID <= 0 {
+        var sid int64
+        sid, err = u.IDGen.GenID(ctx)
+        if err != nil {
+            return nil, fmt.Errorf("gen space_id failed: %w", err)
+        }
+
+        err = u.SpaceRepo.CreateSpace(ctx, &model.Space{
+            ID:          sid,
+            Name:        "Personal Space",
+            Description: "This is your personal space",
+            IconURI:     uploadEntity.EnterpriseIconURI,
+            OwnerID:     userID,
+            CreatorID:   userID,
+            CreatedAt:   now,
+            UpdatedAt:   now,
+        })
+        if err != nil {
+            return nil, fmt.Errorf("create personal space failed: %w", err)
+        }
+
+        spaceID = sid
+    }
+
+    // ... 其他逻辑
+}
+```
+
+Space ID 使用与用户 ID 相同的 ID 生成机制，该机制基于时间戳和计数器生成全局唯一 ID，确保 ID 在分布式系统中的唯一性。
+
 ## 后端实现
 
 ### API 路由
@@ -296,3 +443,5 @@ func generateSessionKey(sessionID int64) (string, error) {
 ## 总结
 
 Coze Studio 的登录流程从前端到后端形成了完整的闭环，通过现代化的技术栈和安全措施确保用户身份验证的安全性。整个流程包括用户输入、表单验证、API 调用、密码验证、Session 生成和状态管理等多个环节，每个环节都有相应的安全措施保护用户信息。
+
+登录成功后，系统会通过一系列重定向将用户引导到其默认工作空间的开发页面。这个过程涉及多个路由层级的重定向和工作空间的初始化，最终将用户带到类似 `/space/{space_id}/develop` 的路径上。Space ID 是在用户注册时通过 ID 生成器创建的全局唯一标识符，确保每个用户都有一个唯一的个人工作空间。
